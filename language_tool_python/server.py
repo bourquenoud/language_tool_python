@@ -22,7 +22,7 @@ from .utils import (
     LanguageToolError, ServerError, JavaError, PathError)
 
 
-DEBUG_MODE = False
+DEBUG_MODE = True
 
 # Keep track of running server PIDs in a global list. This way,
 # we can ensure they're killed on exit.
@@ -43,10 +43,9 @@ class LanguageTool:
     
     def __init__(self,  language=None, motherTongue=None,
                         remote_server=None, newSpellings=None,
-                        new_spellings_persist=True,
+                        new_spellings_persist=True, # Never persisit, kept for compatibility
                         host=None, config=None):
         self._new_spellings = None
-        self._new_spellings_persist = new_spellings_persist
         self._host = host or socket.gethostbyname('localhost')
 
         if remote_server:
@@ -65,9 +64,6 @@ class LanguageTool:
                 language = get_locale_language()
             except ValueError:
                 language = FAILSAFE_LANGUAGE
-        if newSpellings:
-            self._new_spellings = newSpellings
-            self._register_spellings(self._new_spellings)
         self._language = LanguageTag(language, self._get_languages())
         self.motherTongue = motherTongue
         self.disabled_rules = set()
@@ -76,6 +72,12 @@ class LanguageTool:
         self.enabled_categories = set()
         self.enabled_rules_only = False
         self.preferred_variants = set()
+        if newSpellings:
+            self._new_spellings = self._register_spellings(newSpellings)
+            print(f"self._new_spellings : {self._new_spellings}")
+        
+        # Reload the configuration
+        self._restart_server()
 
     def __enter__(self):
         return self
@@ -91,11 +93,20 @@ class LanguageTool:
             self.__class__.__name__, self.language, self.motherTongue)
 
     def close(self):
+        if DEBUG_MODE:
+            print("Closing")
         if self._server_is_alive():
             self._terminate_server()
-        if not self._new_spellings_persist and self._new_spellings:
+        print(f"self._new_spellings : {self._new_spellings}")
+        if self._new_spellings:
             self._unregister_spellings()
             self._new_spellings = []
+
+    def _restart_server(self):
+        """Restart the LanguageTool server."""
+        if self._server_is_alive():
+            self._terminate_server()  # Terminate the server if it's running
+        self._start_server_on_free_port()  # Start the server again
 
     @property
     def language(self):
@@ -161,9 +172,13 @@ class LanguageTool:
         self.disabled_categories.update(self._spell_checking_categories)
 
     @staticmethod
-    def _get_valid_spelling_file_path() -> str:
+    def _get_valid_spelling_file_path(language: str) -> str:
+        """Get the valid spelling file path based on the provided language."""
+        primary_language = language.split('-')[0]  # Extract the primary language subtag
         library_path = get_language_tool_directory()
-        spelling_file_path = os.path.join(library_path, "org/languagetool/resource/en/hunspell/spelling.txt")
+        spelling_file_path = os.path.join(library_path, f"org/languagetool/resource/{primary_language}/hunspell/spelling.txt")
+    
+        
         if not os.path.exists(spelling_file_path):
             raise FileNotFoundError("Failed to find the spellings file at {}\n Please file an issue at "
                                     "https://github.com/jxmorris12/language_tool_python/issues"
@@ -171,24 +186,43 @@ class LanguageTool:
         return spelling_file_path
 
     def _register_spellings(self, spellings):
-        spelling_file_path = self._get_valid_spelling_file_path()
-        with open(spelling_file_path, "a+", encoding='utf-8') as spellings_file:
-            spellings_file.write("\n" + "\n".join([word for word in spellings]))
+        spelling_file_path = self._get_valid_spelling_file_path(str(self._language))
+        registered_spellings = []
+        
+        # Load existing spellings
+        with open(spelling_file_path, "r", encoding='utf-8') as spellings_file:
+            existing_spellings = set(spellings_file.read().splitlines())
+
+        # Append only new and unique spellings
+        with open(spelling_file_path, "a", encoding='utf-8') as spellings_file:
+            for word in spellings:
+                if word not in existing_spellings:
+                    spellings_file.write("\n" + word)
+                    existing_spellings.add(word)
+                    registered_spellings.append(word)
+                    
         if DEBUG_MODE:
             print("Registered new spellings at {}".format(spelling_file_path))
 
+        return registered_spellings
+
     def _unregister_spellings(self):
-        spelling_file_path = self._get_valid_spelling_file_path()
-        with open(spelling_file_path, 'r+', encoding='utf-8') as spellings_file:
-            spellings_file.seek(0, os.SEEK_END)
-            for _ in range(len(self._new_spellings)):
-                while spellings_file.read(1) != '\n':
-                    spellings_file.seek(spellings_file.tell() - 2, os.SEEK_SET)
-                spellings_file.seek(spellings_file.tell() - 2, os.SEEK_SET)
-            spellings_file.seek(spellings_file.tell() + 1, os.SEEK_SET)
-            spellings_file.truncate()
+        spelling_file_path = self._get_valid_spelling_file_path(str(self._language))
+        
+        # Read the entire file into memory
+        with open(spelling_file_path, 'r', encoding='utf-8') as spellings_file:
+            file_contents = spellings_file.readlines()
+        
+        # Remove any line from the file that matches any of the new spellings
+        updated_contents = [line for line in file_contents if line.strip() not in self._new_spellings and line.strip() != ""]
+        
+        # Write the updated contents back to the file
+        with open(spelling_file_path, 'w', encoding='utf-8') as spellings_file:
+            spellings_file.writelines(updated_contents)
+        
         if DEBUG_MODE:
             print("Unregistered new spellings at {}".format(spelling_file_path))
+
 
     def _get_languages(self) -> set:
         """Get supported languages (by querying the server)."""
@@ -226,6 +260,8 @@ class LanguageTool:
                         raise LanguageToolError(response.content.decode())
             except (IOError, http.client.HTTPException) as e:
                 if self._remote is False:
+                    if DEBUG_MODE:
+                        print("Hot restarting of the server")
                     self._terminate_server()
                     self._start_local_server()
                 if n + 1 >= num_tries:
